@@ -1,0 +1,13 @@
+# Stage 2: low-frequency physiological state branch.
+model:
+  name: FreqDec-GWNet
+  stage: stage2_state
+  state_core: gru
+  detach_encoder: true
+
+training:
+  sampler: chronological_windows
+  carry_state: true
+  carry_state_detach: true
+  first_window_warmup: true
+

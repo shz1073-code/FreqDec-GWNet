@@ -1,0 +1,11 @@
+# Stage 1: FAST-LiteNet-derived guidewire observation front-end.
+model:
+  name: FreqDec-GWNet
+  stage: stage1_seg
+  local_frontend: fast_litenet
+  state_core: none
+
+training:
+  sampler: random_window
+  use_state_branch: false
+

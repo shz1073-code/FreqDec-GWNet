@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+env/
+.env
+
+# Data and generated artifacts
+data/raw/
+data/interim/
+data/processed/
+data/state_labels/
+experiments/
+checkpoints/
+reports/
+notebooks/.ipynb_checkpoints/
+
+# Large medical/image artifacts
+*.dcm
+*.nii
+*.nii.gz
+*.mha
+*.mhd
+*.h5
+*.hdf5
+*.ckpt
+*.pth
+*.pt
+*.onnx
+*.mp4
+*.avi
+
+# System/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+

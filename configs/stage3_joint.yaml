@@ -1,0 +1,11 @@
+# Stage 3: sequence-relative motion decoupling and application validation.
+model:
+  name: FreqDec-GWNet
+  stage: stage3_joint
+  motion_field: relative_increment
+
+motion_loss:
+  detach_prev_feature: true
+  detach_curr_feature: true
+  detach_state_input: false
+
