@@ -1,13 +1,56 @@
-# Stage 2: low-frequency physiological state branch.
+# Stage 2 — train GlobalStateBranch on top of a frozen R1 backbone.
+#
+# Key invariants enforced by the trainer (scripts/train_stage2_state.py):
+#   * R1 (encoder + STA + decoder + seg_head) is frozen.
+#   * GlobalStateBranch.detach_encoder = True (PROJECT_CONSTRAINTS_19.6 §5).
+#   * StateLoss = circular phase + amp-scale-normalized SmoothL1 + burn-in.
+#
+# Long sequences are mandatory here: T_window = 64 covers ~4.3 s at 15 fps,
+# enough for at least one full respiratory cycle. Stride = T_window / 2 gives
+# 50% overlap which keeps the stage-2 training set diverse without overfitting.
+
 model:
   name: FreqDec-GWNet
   stage: stage2_state
-  state_core: gru
-  detach_encoder: true
+  state_core: gru                        # baseline; "mamba" is an ablation
+  state_proj_dim: 128
+  state_hidden_dim: 64
+  state_lp_kernel: 5
+  state_d_state: 16                       # only used when state_core=mamba
+  state_detach_encoder: true              # §5 red-line; ablation: false
+  state_learnable_lp: true
 
 training:
-  sampler: chronological_windows
-  carry_state: true
-  carry_state_detach: true
-  first_window_warmup: true
+  sampler: chronological_windows          # FluoroSequenceWindowDataset, stride sweep
+  T_window: 64
+  stride: 32                              # default = T_window // 2
+  batch_size: 1                           # 4090 24 GB ≈ T_window=64 + width_mult=1.0
+  num_workers: 4
+  optimizer: AdamW
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  scheduler: CosineAnnealingLR
+  scheduler_eta_min: 1.0e-6
+  epochs: 30
+  amp: false                              # match stage 1 stability profile
+  carry_state: true                       # forward_window with non-zero h0 carry
+  carry_state_detach: true                # h0 detached between windows
+  first_window_warmup: true               # burn-in mask handles the first frames
 
+loss:
+  name: StateLoss
+  lambda_amp: 0.5
+  burn_in_ratio: 0.2
+  burn_in_min_frames: 3
+  burn_in_weight: 0.1
+
+data:
+  default_dataset: clean                  # 47 train + 10 val bursts
+  splits: [train, val, test]
+  state_labels_dir: reports/state_labels  # produced by Phase B pipeline
+
+io:
+  save_prefix: stage2_state_v1
+  checkpoint_dir: experiments/checkpoints
+  log_dir: experiments/logs
+  stage1_ckpt: experiments/checkpoints/stage1_v1_best.pth   # required at runtime

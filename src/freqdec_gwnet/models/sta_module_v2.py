@@ -2,8 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# 导入我们第一阶段写好的频域分支 (无需修改，完美继承)
-from frequency import FrequencyBranch, LocalSpatialFrequencyFusion, MultiScaleLocalSpatialFrequencyFusion
+# 频域分支（继承自 19.x 第一阶段；保持完整路径，避免相对导入歧义）
+from freqdec_gwnet.models.frequency import (
+    FrequencyBranch,
+    LocalSpatialFrequencyFusion,
+    MultiScaleLocalSpatialFrequencyFusion,
+)
 
 
 class TemporalBranchV2(nn.Module):

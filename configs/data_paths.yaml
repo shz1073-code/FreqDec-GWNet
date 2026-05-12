@@ -1,0 +1,62 @@
+# Canonical absolute paths to FreqDec-GWNet datasets and annotations.
+#
+# Container-side mount layout assumed by every absolute path below:
+#     /workspace                  ->  /home/kuka7/Desktop/fast-litenet
+#     /workspace/FreqDec-GWNet    ->  /home/kuka7/Desktop/FreqDec-GWNet
+#     /workspace/shz              ->  /home/kuka7/Desktop/shz
+#
+# Each dataset must declare which subdirectory holds the images and which
+# holds the wire labels — clean/aug/ori use ``images/labels``, but the
+# tip-annotated dense_v1 source uses ``raw_images/reference_masks``.
+
+datasets:
+  # 整理后的单导丝开源数据 (序列较短 / 用于 stage1 分割训练)
+  clean:
+    root: /workspace/shz/clean_data
+    splits: [train, val, test]
+    images_subdir: images
+    labels_subdir: labels
+
+  # clean 的物理增广版本 (扩 train 用)
+  aug:
+    root: /workspace/shz/aug_data
+    splits: [train]
+    images_subdir: images
+    labels_subdir: labels
+    manifest_csv: /workspace/shz/aug_data/aug_manifest.csv
+
+  # 原始未整理 (含双导丝)
+  ori:
+    root: /workspace/shz/ori_data
+    splits: [train, val, test]
+    images_subdir: images
+    labels_subdir: labels
+
+  # tip CSV 的图像源之一：稠密标注 (795 行 / 6 序列，所有帧都标了 tip)
+  # 目录结构是 kind_then_split，与 clean/aug/ori 相反
+  dense_v1:
+    root: /workspace/data/annotations/tip_control_dense_v1
+    splits: [train, val, test]
+    images_subdir: raw_images
+    labels_subdir: reference_masks
+    layout: kind_then_split
+
+  # tip CSV 的图像源之二：稀疏标注 (424 行，按帧抽样标 tip)
+  sparse_v1:
+    root: /workspace/data/annotations/tip_control_v1
+    splits: [train, val, test]
+    images_subdir: raw_images
+    labels_subdir: reference_masks
+    layout: kind_then_split
+
+annotations:
+  # 导丝尖端 landmark CSV (1219 帧合并版)
+  tip_csv: /workspace/data/annotations/tip_control_merged_v2.csv
+  tip_csv_train: /workspace/data/annotations/tip_control_merged_v2_train.csv
+  tip_csv_val: /workspace/data/annotations/tip_control_merged_v2_val.csv
+  tip_csv_test: /workspace/data/annotations/tip_control_merged_v2_test.csv
+  # tip CSV 的 source_dataset 列对应到哪些数据集 (用于自检 + 解析图像路径)
+  # 这里 key = CSV 里的 source_dataset 值，value = 上面 datasets 里的名字
+  tip_source_datasets:
+    dense_v1: dense_v1
+    sparse_v1: sparse_v1

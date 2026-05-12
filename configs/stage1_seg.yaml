@@ -1,11 +1,52 @@
-# Stage 1: FAST-LiteNet-derived guidewire observation front-end.
+# Stage 1 — FAST-LiteNet-derived guidewire observer (R1).
+#
+# This is the documentation-style canonical config; the trainer
+# (scripts/train_stage1_seg.py) reads its hyperparameters from CLI flags so
+# that DDP / sweep / ablation runs can override individual values without
+# editing YAML. The values below capture the *intended* default protocol
+# for stage 1 — keep this file in sync with the script.
+
 model:
   name: FreqDec-GWNet
   stage: stage1_seg
   local_frontend: fast_litenet
-  state_core: none
+  state_core: none                       # state branch is not exercised here
+  width_mult: 1.0                        # 1.0 = S, 1.5 = M, 2.0 = L
+  in_channels: 1
+  num_classes: 1
+  freq_mode: global                      # global FFT residual (cheapest)
+  use_refine_head: false
+  multi_task: false
+  edge_aux: false
 
 training:
-  sampler: random_window
-  use_state_branch: false
+  sampler: sliding_window                # 5-frame windows over each burst
+  seq_len: 5                             # short context — segmentation only
+  batch_size: 4                          # global batch (DDP-aware)
+  num_workers: 8
+  optimizer: AdamW
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+  scheduler: CosineAnnealingLR
+  scheduler_eta_min: 1.0e-6
+  epochs: 50
+  amp: false                             # FFT branch + AMP can be unstable
+  augmentation_profile: fluoro_hard
+  hflip_p: 0.5
+  vflip_p: 0.5
 
+loss:
+  name: FAST_LiteNet_Loss
+  lambda_cldice: 0.5
+  lambda_boundary: 0.5
+
+data:
+  # Concrete paths come from configs/data_paths.yaml; the trainer's
+  # --data-root defaults to /workspace/shz/clean_data.
+  default_dataset: clean
+  splits: [train, val, test]
+
+io:
+  save_prefix: stage1_v1
+  checkpoint_dir: experiments/checkpoints
+  log_dir: experiments/logs

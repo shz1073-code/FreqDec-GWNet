@@ -1,11 +1,76 @@
-# Stage 3: sequence-relative motion decoupling and application validation.
+# Stage 3 — sequence-relative motion decoupling, joint training.
+#
+# Key invariants enforced by the trainer (scripts/train_stage3_joint.py):
+#   * R1 stays frozen (continues stage-2 freeze policy).
+#   * State_branch + Motion_field train jointly.
+#   * MotionLoss runs at 1/8 feature resolution, with Δu rescaled by
+#     (feat_size / full_size). The wire mask is max-pooled to the same
+#     resolution before computing the dilated background ROI.
+#   * §5 detach policy: detach_prev_feature = detach_curr_feature = True;
+#     detach_state_input = False (handled inside RelativeMotionField).
+#   * R3 main path: 6-D parameterization
+#     (state_dim_for_motion = 3 -> 2*3 = 6 input features into G_delta).
+#   * Reference frame per window: per-sample LongTensor produced by the
+#     dataset (see FluoroSequenceWindowDataset.window_local remap).
+
 model:
   name: FreqDec-GWNet
   stage: stage3_joint
-  motion_field: relative_increment
+  state_core: gru
+  state_proj_dim: 128
+  state_hidden_dim: 64
+  state_detach_encoder: true              # carried from stage 2
+
+  motion_field: relative_increment        # R3 red-line wording
+  motion_state_dim: 3                     # (cos, sin, amp); confidence dropped
+  motion_hidden_dim: 64
+  motion_output_dim: 2                    # 2-D global translation in pixels
 
 motion_loss:
-  detach_prev_feature: true
+  detach_prev_feature: true               # §5 main configuration
   detach_curr_feature: true
-  detach_state_input: false
+  detach_state_input: false               # enforced inside RelativeMotionField
+  wire_dilate_k: 3
+  feat_resolution_scale: 0.125            # 1/8 (encoder out_channels[2])
 
+training:
+  sampler: chronological_windows
+  T_window: 64
+  stride: 32
+  batch_size: 1
+  num_workers: 4
+  optimizer: AdamW
+  lr: 5.0e-4                              # smaller than stage 2 (joint refinement)
+  weight_decay: 1.0e-4
+  scheduler: CosineAnnealingLR
+  scheduler_eta_min: 1.0e-6
+  epochs: 30
+  amp: false
+
+loss:
+  lambda_state: 1.0
+  lambda_motion: 0.5
+  state:
+    lambda_amp: 0.5
+    burn_in_ratio: 0.2
+    burn_in_min_frames: 3
+    burn_in_weight: 0.1
+
+ablations:
+  # CLI flags for the §6.1 main-paper ablation sweeps.
+  # absolute_vs_relative:        --motion-state-dim 3 (relative) or G_motion(s_t) variant
+  # state_protocol:              --freeze-state-branch / default / --no-state-detach-encoder
+  # detach_policy:               --no-detach-prev-feature / --no-detach-curr-feature
+  # reference_selection:         alter ReferenceSelector strategy in dataset prep
+  # gru_vs_mamba:                --state-core-type mamba
+
+data:
+  default_dataset: clean
+  splits: [train, val, test]
+  state_labels_dir: reports/state_labels
+
+io:
+  save_prefix: stage3_joint_v1
+  checkpoint_dir: experiments/checkpoints
+  log_dir: experiments/logs
+  stage2_ckpt: experiments/checkpoints/stage2_state_v1_best.pth

@@ -12,6 +12,8 @@ from tqdm import tqdm
 
 # 和训练脚本保持一致，方便直接在当前工程目录下运行。
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 19.x 旧版本依赖一个全局 BASE_DIR 但没定义，这里显式补上。
+BASE_DIR = PROJECT_ROOT
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
 
 from freqdec_gwnet.data.real_dataset import RealGuidewireVideoDataset
@@ -146,6 +148,12 @@ def parse_args():
     parser.add_argument("--seq-len", type=int, default=5, help="Sequence length.")
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size for evaluation.")
     parser.add_argument("--num-workers", type=int, default=4, help="Number of DataLoader workers.")
+    parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=0,
+        help="If > 0, stop evaluation after this many batches. Use for sanity checks.",
+    )
     parser.add_argument("--threshold", type=float, default=0.5, help="Sigmoid threshold for binary mask.")
     parser.add_argument(
         "--max-visualizations",
@@ -422,6 +430,8 @@ def evaluate(args):
     with torch.no_grad():
         pbar = tqdm(loader, desc=f"Evaluating [{args.split}]")
         for batch_idx, (images_seq, masks_seq) in enumerate(pbar):
+            if args.max_batches > 0 and batch_idx >= args.max_batches:
+                break
             images_seq = images_seq.to(device, non_blocking=True)
             masks_seq = masks_seq.to(device, non_blocking=True)
             batch_size, seq_len, _, _, _ = images_seq.shape

@@ -22,6 +22,9 @@ from tqdm import tqdm
 
 # --- 解决工程内包导入路径问题 ---
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# BASE_DIR 用于在 train() 内部拼接 experiments/checkpoints 等路径；
+# 19.x 旧版本依赖一个全局 BASE_DIR 但没定义，这里显式补上。
+BASE_DIR = PROJECT_ROOT
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
 
 from freqdec_gwnet.data.real_dataset import RealGuidewireVideoDataset
@@ -316,6 +319,20 @@ def parse_args():
         "--sync-bn",
         action="store_true",
         help="Convert BatchNorm to SyncBatchNorm when using DDP.",
+    )
+    parser.add_argument(
+        "--max-train-iters",
+        type=int,
+        default=0,
+        help="If > 0, stop the training loop after this many batches per epoch. "
+             "Use for fast sanity checks (e.g. --max-train-iters 2).",
+    )
+    parser.add_argument(
+        "--max-val-iters",
+        type=int,
+        default=0,
+        help="If > 0, stop validation after this many batches per epoch. "
+             "Pair with --max-train-iters for end-to-end sanity runs.",
     )
     return parser.parse_args()
 
@@ -765,7 +782,10 @@ def train(args):
         train_epoch_batches = 0.0
         pbar_train = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS} [Train]") if is_main_process() else train_loader
 
-        for images_seq, masks_seq in pbar_train:
+        for batch_idx, (images_seq, masks_seq) in enumerate(pbar_train):
+            if args.max_train_iters > 0 and batch_idx >= args.max_train_iters:
+                # sanity-check 早退：跳出训练循环但仍走完后面的 val + 保存逻辑
+                break
             images_seq = images_seq.to(device, non_blocking=True)
             masks_seq = masks_seq.to(device, non_blocking=True)
             _, T, _, _, _ = images_seq.shape
@@ -853,7 +873,9 @@ def train(args):
         pbar_val = tqdm(val_loader, desc=f"Epoch {epoch}/{EPOCHS} [Val]") if is_main_process() else val_loader
 
         with torch.no_grad():
-            for images_seq, masks_seq in pbar_val:
+            for batch_idx, (images_seq, masks_seq) in enumerate(pbar_val):
+                if args.max_val_iters > 0 and batch_idx >= args.max_val_iters:
+                    break
                 images_seq = images_seq.to(device, non_blocking=True)
                 masks_seq = masks_seq.to(device, non_blocking=True)
                 _, T, _, _, _ = images_seq.shape
