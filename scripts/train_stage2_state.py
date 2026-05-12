@@ -109,6 +109,10 @@ def parse_args():
                    help=">0 caps train iterations per epoch (sanity)")
     p.add_argument("--max-val-iters", type=int, default=0)
     p.add_argument("--save-prefix", default="stage2_state")
+    p.add_argument("--resume", action="store_true",
+                   help="if {save_prefix}_last.pth exists, load it and "
+                        "continue from the next epoch (background "
+                        "pipelines depend on this)")
 
     # §6.1 main ablation #2: state training protocol
     p.add_argument(
@@ -519,8 +523,39 @@ def train(args):
     writer = SummaryWriter(log_dir=str(log_dir)) if is_main() else None
     best_loss = float("inf")
     global_step = 0
+    start_epoch = 1
 
-    for epoch in range(1, args.epochs + 1):
+    # ---- Auto-resume from {prefix}_last.pth if --resume and the file exists.
+    # 这条路径让长时间运行的训练在脚本崩溃/重启后能从上次 epoch 接着跑。
+    if args.resume:
+        resume_path = last_path
+        if resume_path.is_file():
+            ck = torch.load(resume_path, map_location="cpu", weights_only=False)
+            sd = ck.get("model_state_dict", ck)
+            sd = {
+                (k[len("module."):] if k.startswith("module.") else k): v
+                for k, v in sd.items()
+            }
+            inner = model.module if hasattr(model, "module") else model
+            miss, unex = inner.load_state_dict(sd, strict=False)
+            if "optimizer_state_dict" in ck:
+                optimizer.load_state_dict(ck["optimizer_state_dict"])
+            if "scheduler_state_dict" in ck:
+                scheduler.load_state_dict(ck["scheduler_state_dict"])
+            if "scaler_state_dict" in ck:
+                scaler.load_state_dict(ck["scaler_state_dict"])
+            start_epoch = int(ck.get("epoch", 0)) + 1
+            global_step = int(ck.get("global_step", 0))
+            best_loss = float(ck.get("best_val_loss", float("inf")))
+            print0(
+                f"🔁 RESUME — start_epoch={start_epoch}, "
+                f"global_step={global_step}, best_val={best_loss:.4f} "
+                f"(missing={len(miss)}, unexpected={len(unex)})"
+            )
+        else:
+            print0(f"⚠️  --resume given but {resume_path} missing; starting fresh")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 

@@ -120,6 +120,7 @@ def evaluate_sequence(
     cycle_n_phase_bins: int = 12,
     cycle_amplitude_tolerance: float = 0.20,
     cycle_min_gap_frames: int = 8,
+    reset_every: int = 0,
     model: Optional[FreqDecGWNet] = None,
     device: str = "cpu",
 ) -> dict:
@@ -163,6 +164,22 @@ def evaluate_sequence(
         # state 用于 cycle-consistency 检测：取 [cos, sin, amp]
         s_seq = out["state"][..., :3].cpu()                     # [1, T, 3]
         state_source_used = "freqdec_gwnet_ckpt"
+        # Reference-reset: cumulative formulation accumulates drift over long
+        # bursts; in a deployed system the operator periodically re-anchors,
+        # which we simulate by zeroing U every ``reset_every`` frames.
+        # 这是 A-lite 列表的第 4 项 "relative reset"。
+        if reset_every and reset_every > 0:
+            new_U = torch.zeros_like(U)
+            for chunk_start in range(0, T, reset_every):
+                chunk_end = min(T, chunk_start + reset_every)
+                if chunk_end <= chunk_start:
+                    continue
+                # within-chunk cumulative sum of Δu, reset at boundaries
+                chunk_delta = delta_u[chunk_start:chunk_end].clone()
+                chunk_delta[0] = 0.0           # reset Δu_0 = 0 at each anchor
+                new_U[chunk_start:chunk_end] = torch.cumsum(chunk_delta, dim=0)
+            U = new_U
+            state_source_used += f"+reset_every_{reset_every}"
     else:
         # 旧的 placeholder 路径（保留用于无 ckpt 时的流水线检查）
         s_seq = make_state_placeholder(T, mode=state_source)
@@ -297,6 +314,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                              "(swap when state-branch ckpt is available)")
     parser.add_argument("--warmup-min", type=int, default=5)
     parser.add_argument("--warmup-max", type=int, default=10)
+    parser.add_argument("--reset-every", type=int, default=0,
+                        help="if > 0, zero-out U every N frames at eval — "
+                             "mimics a deployed system that re-anchors "
+                             "periodically (paper §III.C reference reset)")
     # Trained-model integration: when --ckpt is given, run actual inference
     # via FreqDecGWNet instead of the zero-init placeholder.
     parser.add_argument("--ckpt", type=Path, default=None,
@@ -400,6 +421,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             model=model,
             device=device,
             cycle_min_gap_frames=args.cycle_min_gap_frames,
+            reset_every=args.reset_every,
         )
         line = (
             f"  {sname:15s}  "

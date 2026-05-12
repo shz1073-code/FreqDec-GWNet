@@ -155,6 +155,8 @@ def parse_args():
     p.add_argument("--max-train-iters", type=int, default=0)
     p.add_argument("--max-val-iters", type=int, default=0)
     p.add_argument("--save-prefix", default="stage3_joint")
+    p.add_argument("--resume", action="store_true",
+                   help="auto-resume from {save_prefix}_last.pth if present")
 
     # Distributed
     p.add_argument("--distributed", action="store_true")
@@ -593,8 +595,37 @@ def train(args):
     writer = SummaryWriter(log_dir=str(log_dir)) if is_main() else None
     best_loss = float("inf")
     global_step = 0
+    start_epoch = 1
 
-    for epoch in range(1, args.epochs + 1):
+    # Auto-resume — lets the v5 background pipeline retry crashed runs
+    # without losing wall-clock progress.
+    if args.resume:
+        if last_path.is_file():
+            ck = torch.load(last_path, map_location="cpu", weights_only=False)
+            sd = ck.get("model_state_dict", ck)
+            sd = {
+                (k[len("module."):] if k.startswith("module.") else k): v
+                for k, v in sd.items()
+            }
+            inner = model.module if hasattr(model, "module") else model
+            miss, unex = inner.load_state_dict(sd, strict=False)
+            if "optimizer_state_dict" in ck:
+                optimizer.load_state_dict(ck["optimizer_state_dict"])
+            if "scheduler_state_dict" in ck:
+                scheduler.load_state_dict(ck["scheduler_state_dict"])
+            if "scaler_state_dict" in ck:
+                scaler.load_state_dict(ck["scaler_state_dict"])
+            start_epoch = int(ck.get("epoch", 0)) + 1
+            global_step = int(ck.get("global_step", 0))
+            best_loss = float(ck.get("best_val_loss", float("inf")))
+            print0(
+                f"🔁 RESUME — start_epoch={start_epoch}, "
+                f"global_step={global_step}, best_val={best_loss:.4f}"
+            )
+        else:
+            print0(f"⚠️  --resume given but {last_path} missing; fresh start")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
