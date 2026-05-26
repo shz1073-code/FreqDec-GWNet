@@ -270,6 +270,8 @@ class GlobalStateBranch(nn.Module):
         d_state: int = 16,          # Mamba SSM 状态维度（仅 Mamba 时有效）
         detach_encoder: bool = True,    # 关键：默认断开梯度（见 R1/P1）
         learnable_lp: bool = True,  # 低通核是否允许微调
+        output_dim: int = 4,        # 4 = resp-only [cos,sin,amp,conf];
+                                    # 8 = dual-cycle [resp_4, card_4]
     ):
         super().__init__()
 
@@ -304,11 +306,14 @@ class GlobalStateBranch(nn.Module):
                 f"请选择 'gru' 或 'mamba'"
             )
 
-        # 5. 输出头：隐状态 → [cos_phi, sin_phi, amplitude, confidence]
+        # 5. 输出头：隐状态 → output_dim 维
+        # output_dim=4: 单周期 [cos_phi, sin_phi, amplitude, confidence]
+        # output_dim=8: 双周期解耦 [resp_4, card_4]; 下游切片使用
+        self.output_dim = int(output_dim)
         self.output_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 4)
+            nn.Linear(hidden_dim, self.output_dim)
             # 注意：不在这里加 tanh/sigmoid，由外部损失函数处理
             # cos/sin 在损失计算前做 F.normalize，amplitude 在损失中除以 amp_scale
         )

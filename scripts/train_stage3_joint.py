@@ -73,6 +73,13 @@ def parse_args():
     p.add_argument("--data-root", required=True, type=Path)
     p.add_argument("--state-labels-dir", required=True, type=Path)
     p.add_argument("--exclude-sequences-file", type=str, default=None)
+    # Pooled split (mirrors train_stage2_state.py): use one virtual split
+    # dir and pass explicit train/val sequence lists. Enables training on
+    # the expanded 137-seq pool.
+    p.add_argument("--cv-split", type=str, default=None,
+                   help="virtual split name under data_root (e.g. 'expanded_pool')")
+    p.add_argument("--cv-train-file", type=str, default=None)
+    p.add_argument("--cv-val-file", type=str, default=None)
     p.add_argument("--T-window", type=int, default=64)
     p.add_argument("--stride", type=int, default=None)
     p.add_argument("--img-size", type=int, default=512)
@@ -491,18 +498,44 @@ def train(args):
             ln.strip() for ln in Path(args.exclude_sequences_file).read_text().splitlines()
             if ln.strip() and not ln.strip().startswith("#")
         ]
-    train_set = FluoroSequenceWindowDataset(
-        data_root=args.data_root, state_labels_dir=args.state_labels_dir,
-        split="train", T_window=args.T_window, stride=args.stride,
-        img_size=(args.img_size, args.img_size),
-        excluded_sequences=excluded,
-    )
-    val_set = FluoroSequenceWindowDataset(
-        data_root=args.data_root, state_labels_dir=args.state_labels_dir,
-        split="val", T_window=args.T_window, stride=args.stride,
-        img_size=(args.img_size, args.img_size),
-        excluded_sequences=excluded,
-    )
+
+    def _read_list(path):
+        return [ln.strip() for ln in Path(path).read_text().splitlines()
+                if ln.strip() and not ln.strip().startswith("#")]
+
+    # Pooled-split mode (mirrors train_stage2_state.py): when --cv-split is
+    # set, both datasets read from data_root/<cv_split>/... and the
+    # included sequences come from explicit .txt files.
+    if getattr(args, "cv_split", None):
+        if not args.cv_train_file or not args.cv_val_file:
+            raise SystemExit("--cv-split requires --cv-train-file and --cv-val-file")
+        train_seqs = _read_list(args.cv_train_file)
+        val_seqs = _read_list(args.cv_val_file)
+        train_set = FluoroSequenceWindowDataset(
+            data_root=args.data_root, state_labels_dir=args.state_labels_dir,
+            split=args.cv_split, T_window=args.T_window, stride=args.stride,
+            img_size=(args.img_size, args.img_size),
+            included_sequences=train_seqs,
+        )
+        val_set = FluoroSequenceWindowDataset(
+            data_root=args.data_root, state_labels_dir=args.state_labels_dir,
+            split=args.cv_split, T_window=args.T_window, stride=args.stride,
+            img_size=(args.img_size, args.img_size),
+            included_sequences=val_seqs,
+        )
+    else:
+        train_set = FluoroSequenceWindowDataset(
+            data_root=args.data_root, state_labels_dir=args.state_labels_dir,
+            split="train", T_window=args.T_window, stride=args.stride,
+            img_size=(args.img_size, args.img_size),
+            excluded_sequences=excluded,
+        )
+        val_set = FluoroSequenceWindowDataset(
+            data_root=args.data_root, state_labels_dir=args.state_labels_dir,
+            split="val", T_window=args.T_window, stride=args.stride,
+            img_size=(args.img_size, args.img_size),
+            excluded_sequences=excluded,
+        )
 
     train_sampler = (
         DistributedSampler(train_set, args.world_size, args.rank, shuffle=True, drop_last=True)

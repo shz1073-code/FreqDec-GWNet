@@ -87,7 +87,11 @@ class FluoroSequenceWindowDataset(Dataset):
         require_state_label: bool = True,
         min_burst_frames: Optional[int] = None,    # default: T_window
         excluded_sequences: Optional[List[str]] = None,
+        included_sequences: Optional[List[str]] = None,
         state_labels_subdir_per_split: bool = True,
+        augment: bool = False,
+        augment_seed: int = 0,
+        cardiac_labels_dir: Optional[str] = None,  # 启用双周期解耦时设置
     ):
         self.data_root = Path(data_root)
         # Phase B 的 generate_state_labels.py 默认按 {split}/{seq}.npz 落盘，
@@ -109,6 +113,23 @@ class FluoroSequenceWindowDataset(Dataset):
             if min_burst_frames is not None else self.T_window
         )
         self.excluded_sequences = set(excluded_sequences or [])
+        # If given, ONLY these sequences are kept (applied after exclusion).
+        # Used by k-fold cross-validation to carve a fold out of a pooled
+        # sequence directory.
+        self.included_sequences = (
+            set(included_sequences) if included_sequences is not None else None
+        )
+        self.augment = bool(augment)
+        self.augment_seed = int(augment_seed)
+        # Cardiac labels: if dir given, mirror state_labels_dir layout.
+        if cardiac_labels_dir is not None:
+            card_root = Path(cardiac_labels_dir)
+            if state_labels_subdir_per_split and (card_root / split).is_dir():
+                self.cardiac_labels_dir = card_root / split
+            else:
+                self.cardiac_labels_dir = card_root
+        else:
+            self.cardiac_labels_dir = None
 
         if self.T_window < 16:
             raise ValueError(
@@ -146,6 +167,7 @@ class FluoroSequenceWindowDataset(Dataset):
     def _scan_sequences(self) -> None:
         skipped: Dict[str, int] = {
             "excluded": 0,
+            "not_included": 0,
             "no_label_dir": 0,
             "no_state_label": 0,
             "too_short": 0,
@@ -156,6 +178,10 @@ class FluoroSequenceWindowDataset(Dataset):
                 continue
             if seq_name in self.excluded_sequences:
                 skipped["excluded"] += 1
+                continue
+            if (self.included_sequences is not None
+                    and seq_name not in self.included_sequences):
+                skipped["not_included"] += 1
                 continue
 
             seq_lbl = self.labels_dir / seq_name
@@ -173,8 +199,22 @@ class FluoroSequenceWindowDataset(Dataset):
                 skipped["too_short"] += 1
                 continue
 
+            # Phase-B can produce labels shorter than the image folder
+            # (warmup-edge trimming or quality-driven truncation). The
+            # window sampler must respect the label's length too — otherwise
+            # __getitem__ raises mid-training.
+            try:
+                sl_peek = StateLabel.load_npz(state_path)
+                effective_T = min(len(frames), int(sl_peek.num_frames))
+            except Exception:                                    # corrupt npz
+                skipped["no_state_label"] += 1
+                continue
+            if effective_T < self.min_burst_frames:
+                skipped["too_short"] += 1
+                continue
+
             # 滑窗位置：起点从 0 到 (T_seq − T_window)
-            T_seq = len(frames)
+            T_seq = effective_T
             last_start = T_seq - self.T_window
             for start in range(0, last_start + 1, self.stride):
                 self.windows.append(_WindowIndex(
@@ -216,6 +256,72 @@ class FluoroSequenceWindowDataset(Dataset):
     def __len__(self) -> int:
         return len(self.windows)
 
+    # ------------------------------------------------------------------
+    # Real-data augmentation (k-fold CV training)
+    # ------------------------------------------------------------------
+
+    def _augment_window(
+        self, images: np.ndarray, wire: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Apply ONE random augmentation, identical across all T frames.
+
+        A burst-consistent transform leaves frame-to-frame respiratory
+        motion untouched, so the state labels stay valid. Two families:
+
+        * geometric — small affine (rotation/scale/translation) applied
+          to image + wire-mask with the SAME matrix;
+        * photometric — brightness/contrast/gamma/noise on the image only.
+
+        Stochastic per call (entropy-seeded) so each epoch sees fresh
+        variants of every window.
+        """
+        rng = np.random.default_rng()
+        T, _, H, W = images.shape
+
+        # --- geometric: one affine matrix for the whole window ---
+        angle = float(rng.uniform(-5.0, 5.0))
+        scale = float(rng.uniform(0.95, 1.05))
+        tx = float(rng.uniform(-0.04, 0.04)) * W
+        ty = float(rng.uniform(-0.04, 0.04)) * H
+        M = cv2.getRotationMatrix2D((W / 2.0, H / 2.0), angle, scale)
+        M[0, 2] += tx
+        M[1, 2] += ty
+        do_geom = angle != 0.0 or scale != 1.0 or tx != 0.0 or ty != 0.0
+
+        # --- photometric params (image only) ---
+        brightness = float(rng.uniform(-0.10, 0.10))
+        contrast = float(rng.uniform(0.85, 1.15))
+        gamma = float(rng.uniform(0.80, 1.25))
+        noise_sigma = float(rng.uniform(0.0, 0.02))
+        flip = bool(rng.random() < 0.5)
+
+        out_img = np.empty_like(images)
+        out_wire = np.empty_like(wire)
+        for k in range(T):
+            im = images[k, 0]
+            wm = wire[k, 0]
+            if do_geom:
+                im = cv2.warpAffine(
+                    im, M, (W, H), flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REFLECT_101,
+                )
+                wm = cv2.warpAffine(
+                    wm, M, (W, H), flags=cv2.INTER_NEAREST,
+                    borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+                )
+            if flip:
+                im = im[:, ::-1]
+                wm = wm[:, ::-1]
+            # photometric (image only)
+            im = (im - 0.5) * contrast + 0.5 + brightness
+            im = np.clip(im, 0.0, 1.0)
+            im = np.power(im, gamma)
+            if noise_sigma > 0:
+                im = im + rng.normal(0.0, noise_sigma, im.shape).astype(np.float32)
+            out_img[k, 0] = np.clip(im, 0.0, 1.0).astype(np.float32)
+            out_wire[k, 0] = (wm > 0.5).astype(np.float32)
+        return out_img, out_wire
+
     def _load_state_label(self, seq_name: str, path: Path) -> StateLabel:
         if seq_name not in self._state_label_cache:
             self._state_label_cache[seq_name] = StateLabel.load_npz(path)
@@ -250,6 +356,11 @@ class FluoroSequenceWindowDataset(Dataset):
                         )
                     wire[k, 0] = (mask.astype(np.float32) / 255.0 > 0.5).astype(np.float32)
 
+        # 1b) 真实数据增强（仅 train fold）。所有变换在 T 帧上一致施加，
+        # 因此呼吸的相对运动不变 —— cos/sin/amplitude 标签依然有效。
+        if self.augment:
+            images, wire = self._augment_window(images, wire)
+
         # 2) 切窗 state label
         sl = self._load_state_label(w.seq_name, w.state_label_path)
         if sl.num_frames < start + T:
@@ -259,7 +370,7 @@ class FluoroSequenceWindowDataset(Dataset):
             )
         sl_slice = slice(start, start + T)
 
-        return {
+        sample = {
             "images": torch.from_numpy(images),
             "wire_mask": torch.from_numpy(wire),
             "cos_phi": torch.from_numpy(sl.cos_phi[sl_slice].copy()),
@@ -268,14 +379,45 @@ class FluoroSequenceWindowDataset(Dataset):
             "valid_mask": torch.from_numpy(sl.valid_mask[sl_slice].copy()),
             "amp_scale": torch.tensor(sl.amp_scale, dtype=torch.float32),
             "reference_index": torch.tensor(
-                # 把全局 reference_index 转换成 window-local：
-                # 若 ref 在窗口内则取相对位置，否则用窗口起点（fallback）
                 max(0, min(T - 1, sl.reference_index - start)),
                 dtype=torch.long,
             ),
             "seq_name": w.seq_name,
             "window_start": torch.tensor(start, dtype=torch.long),
         }
+
+        # Optional: cardiac labels (dual-cycle training).
+        # Phase-B for the cardiac band may produce a DIFFERENT length than
+        # respiratory (band-pass + Hilbert have different effective lengths
+        # under the higher passband). We always produce a T-length window
+        # via safe overlap: positions outside the cardiac array's range get
+        # zero with valid=0.
+        if self.cardiac_labels_dir is not None:
+            card_path = self.cardiac_labels_dir / f"{w.seq_name}.npz"
+            if card_path.is_file():
+                card = self._load_state_label(
+                    w.seq_name + "__cardiac", card_path,
+                )
+                cos_c = np.zeros(T, dtype=np.float32)
+                sin_c = np.zeros(T, dtype=np.float32)
+                amp_c = np.zeros(T, dtype=np.float32)
+                val_c = np.zeros(T, dtype=card.valid_mask.dtype)
+                src_lo = max(0, min(start, card.num_frames))
+                src_hi = max(0, min(start + T, card.num_frames))
+                dst_lo = src_lo - start
+                dst_hi = src_hi - start
+                if src_hi > src_lo and dst_hi > dst_lo:
+                    cos_c[dst_lo:dst_hi] = card.cos_phi[src_lo:src_hi]
+                    sin_c[dst_lo:dst_hi] = card.sin_phi[src_lo:src_hi]
+                    amp_c[dst_lo:dst_hi] = card.amplitude[src_lo:src_hi]
+                    val_c[dst_lo:dst_hi] = card.valid_mask[src_lo:src_hi]
+                sample["cardiac_cos_phi"] = torch.from_numpy(cos_c)
+                sample["cardiac_sin_phi"] = torch.from_numpy(sin_c)
+                sample["cardiac_amplitude"] = torch.from_numpy(amp_c)
+                sample["cardiac_valid_mask"] = torch.from_numpy(val_c)
+                sample["cardiac_amp_scale"] = torch.tensor(card.amp_scale,
+                                                            dtype=torch.float32)
+        return sample
 
 
 # ===========================================================================

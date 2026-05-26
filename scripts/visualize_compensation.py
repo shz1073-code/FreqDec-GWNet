@@ -233,8 +233,16 @@ def render_compensation_animation(
     mode: str = "current_to_reference",
     fmt: str = "mp4",
     dpi: int = 150,
+    reset_every: int = 0,
 ) -> dict:
     """Produce the GIF + static PNG for one sequence.
+
+    Args:
+        reset_every: if > 0, re-anchor the cumulative displacement U every
+            N frames (bounded-horizon compensation, paper §III.C). This
+            matches what ``evaluate_drift.py --reset-every`` does and is
+            the deployable operating mode — the operator periodically
+            re-references during a procedure.
 
     Returns a dict with output paths and basic stats.
     """
@@ -254,6 +262,21 @@ def render_compensation_animation(
             mode="stage3_joint", reference_index=0,
         )
     U = out["U"][0].cpu()                                        # [T, 2]
+
+    # ---- bounded-horizon reference reset (paper §III.C) ----
+    # Re-anchor U every reset_every frames so cumulative drift cannot
+    # accumulate beyond one reset window. Δu is recovered from the
+    # per-frame difference of U, then re-accumulated per chunk.
+    if reset_every and reset_every > 0:
+        delta_u = torch.zeros_like(U)
+        delta_u[1:] = U[1:] - U[:-1]
+        new_U = torch.zeros_like(U)
+        for s in range(0, T, reset_every):
+            e = min(T, s + reset_every)
+            chunk = delta_u[s:e].clone()
+            chunk[0] = 0.0                          # reset Δu_0 at each anchor
+            new_U[s:e] = torch.cumsum(chunk, dim=0)
+        U = new_U
 
     # ---- compensated frames ----
     # apply_compensation warps the image stack by -U (current → reference).
@@ -418,6 +441,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                         "(H.264, much sharper than GIF's 256-color palette)")
     p.add_argument("--dpi", type=int, default=150,
                    help="matplotlib DPI for video frames; 200 = print-ready")
+    p.add_argument("--reset-every", type=int, default=0,
+                   help="re-anchor cumulative U every N frames "
+                        "(bounded-horizon compensation; recommended 16 or 32)")
     p.add_argument("--device", default="cuda",
                    choices=("cuda", "cpu"))
 
@@ -459,6 +485,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             mode=args.mode,
             fmt=args.format,
             dpi=args.dpi,
+            reset_every=args.reset_every,
         )
         lines = [
             f"  {sname:15s}  T={result['n_frames']}  "

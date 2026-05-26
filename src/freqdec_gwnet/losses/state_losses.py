@@ -158,21 +158,31 @@ class StateLoss(nn.Module):
         burn_in_ratio: float = 0.2,     # burn-in 比例
         burn_in_min_frames: int = 3,    # 最少 burn-in 帧数
         burn_in_weight: float = 0.1,    # burn-in 帧权重
+        lambda_cardiac: float = 0.0,    # 心跳分支总权重 (0=不启用)
+        lambda_cardiac_amp: float = 0.5,  # 心跳分支内部振幅子权重
     ):
         super().__init__()
         self.lambda_amp = lambda_amp
         self.burn_in_ratio = burn_in_ratio
         self.burn_in_min_frames = burn_in_min_frames
         self.burn_in_weight = burn_in_weight
+        self.lambda_cardiac = float(lambda_cardiac)
+        self.lambda_cardiac_amp = float(lambda_cardiac_amp)
 
     def forward(
         self,
-        state_pred: torch.Tensor,       # [B, T, 4]：cos, sin, amp, conf
+        state_pred: torch.Tensor,       # [B, T, 4] resp-only 或 [B, T, 8] resp+card
         phase_cos_gt: torch.Tensor,     # [B, T]
         phase_sin_gt: torch.Tensor,     # [B, T]
         amp_gt: torch.Tensor,           # [B, T]
         amp_scale: torch.Tensor,        # [B] per-sequence 振幅归一化尺度
         valid_mask: torch.Tensor,       # [B, T] 0=低质量label，1=正常
+        # Dual-cycle (cardiac) GT —— 启用前提: state_pred 是 8 维 且 lambda_cardiac > 0
+        cardiac_cos_gt: torch.Tensor = None,
+        cardiac_sin_gt: torch.Tensor = None,
+        cardiac_amp_gt: torch.Tensor = None,
+        cardiac_amp_scale: torch.Tensor = None,
+        cardiac_valid_mask: torch.Tensor = None,
     ) -> dict:
         """
         返回字典：
@@ -215,13 +225,41 @@ class StateLoss(nn.Module):
             effective_weight
         )
 
-        # 5. 总损失
-        loss_total = loss_phase + self.lambda_amp * loss_amp
+        # 5. 总损失（呼吸部分）
+        loss_resp = loss_phase + self.lambda_amp * loss_amp
+
+        # 6. 可选：心跳分支
+        loss_card_phase = state_pred.new_zeros(())
+        loss_card_amp = state_pred.new_zeros(())
+        if (self.lambda_cardiac > 0.0
+                and state_pred.shape[-1] >= 8
+                and cardiac_cos_gt is not None):
+            card_valid = (cardiac_valid_mask if cardiac_valid_mask is not None
+                          else valid_mask)
+            card_weight = card_valid * burn_in.unsqueeze(0)
+            card_scale = (cardiac_amp_scale if cardiac_amp_scale is not None
+                          else amp_scale)
+            card_scale_bt = card_scale.unsqueeze(1).expand(B, T)
+            loss_card_phase = circular_phase_loss(
+                state_pred[:, :, 4], state_pred[:, :, 5],
+                cardiac_cos_gt, cardiac_sin_gt, card_weight,
+            )
+            loss_card_amp = amplitude_loss(
+                state_pred[:, :, 6],
+                cardiac_amp_gt,
+                card_scale_bt,
+                card_weight,
+            )
+
+        loss_card = loss_card_phase + self.lambda_cardiac_amp * loss_card_amp
+        loss_total = loss_resp + self.lambda_cardiac * loss_card
 
         return {
             "loss_state": loss_total,
             "loss_phase": loss_phase.detach(),
             "loss_amp": loss_amp.detach(),
+            "loss_card_phase": loss_card_phase.detach(),
+            "loss_card_amp": loss_card_amp.detach(),
             "n_valid_frames": effective_weight.sum().detach(),
         }
 

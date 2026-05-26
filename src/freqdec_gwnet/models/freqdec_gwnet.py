@@ -107,6 +107,7 @@ class FreqDecGWNet(nn.Module):
         state_d_state: int = 16,
         state_detach_encoder: bool = True,
         state_learnable_lp: bool = True,
+        state_output_dim: int = 4,    # 4 = resp-only; 8 = dual-cycle (resp+card)
         # ---- R3: forwarded to RelativeMotionField (or its baseline) ----
         motion_state_dim: int = 3,
         motion_hidden_dim: int = 64,
@@ -150,6 +151,7 @@ class FreqDecGWNet(nn.Module):
             d_state=state_d_state,
             detach_encoder=state_detach_encoder,
             learnable_lp=state_learnable_lp,
+            output_dim=state_output_dim,
         )
 
         # 3) R3 — motion field (default = sequence-relative; "absolute"

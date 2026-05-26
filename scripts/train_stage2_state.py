@@ -55,8 +55,30 @@ from freqdec_gwnet.data import (                                     # noqa: E40
     FluoroSequenceWindowDataset,
     is_sequence_boundary,
 )
+from freqdec_gwnet.losses.physiological_priors import (              # noqa: E402
+    physiological_prior_loss,
+)
 from freqdec_gwnet.losses.state_losses import StateLoss               # noqa: E402
 from freqdec_gwnet.models.freqdec_gwnet import FreqDecGWNet           # noqa: E402
+
+
+# ===========================================================================
+# Checkpoint I/O
+# ===========================================================================
+
+
+def _atomic_save(obj, path) -> None:
+    """Write a checkpoint atomically: torch.save to a temp file, then
+    os.replace into place. A crash mid-save (this box segfaults
+    intermittently under cv2-augmented dataloading) can corrupt a
+    plain torch.save target to 0 bytes, which then makes --resume fail
+    with EOFError. os.replace is atomic on the same filesystem, so the
+    real checkpoint is never left half-written.
+    """
+    path = Path(path)
+    tmp = path.parent / (path.name + ".tmp")
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
 
 
 # ===========================================================================
@@ -72,6 +94,21 @@ def parse_args():
     p.add_argument("--state-labels-dir", required=True, type=Path,
                    help="dir with per-sequence StateLabel .npz files")
     p.add_argument("--exclude-sequences-file", type=str, default=None)
+    # ---- k-fold cross-validation (sequence-level) ----
+    p.add_argument("--cv-split", type=str, default=None,
+                   help="if set, BOTH train and val datasets read this one "
+                        "(pooled) split; the train/val sequence partition "
+                        "is then given explicitly by --cv-train-file / "
+                        "--cv-val-file. Use for k-fold CV.")
+    p.add_argument("--cv-train-file", type=str, default=None,
+                   help="text file, one sequence name per line — the "
+                        "training fold (used only with --cv-split)")
+    p.add_argument("--cv-val-file", type=str, default=None,
+                   help="text file, one sequence name per line — the "
+                        "held-out fold (used only with --cv-split)")
+    p.add_argument("--augment", action="store_true",
+                   help="enable burst-consistent real-data augmentation "
+                        "on the training set (geometry + photometric)")
     p.add_argument("--T-window", type=int, default=64)
     p.add_argument("--stride", type=int, default=None,
                    help="default = T_window // 2")
@@ -113,6 +150,31 @@ def parse_args():
                    help="if {save_prefix}_last.pth exists, load it and "
                         "continue from the next epoch (background "
                         "pipelines depend on this)")
+    # §III.E physiological priors (paper §IV.E ablation)
+    p.add_argument("--lambda-phase-smooth", type=float, default=0.0,
+                   help=">0 enables phase smoothness prior")
+    p.add_argument("--lambda-amp-smooth", type=float, default=0.0,
+                   help=">0 enables amplitude smoothness prior")
+    p.add_argument("--lambda-spectral", type=float, default=0.0,
+                   help=">0 enables spectral concentration prior")
+    p.add_argument("--prior-fs", type=float, default=15.0)
+    p.add_argument("--prior-band-low", type=float, default=0.15)
+    p.add_argument("--prior-band-high", type=float, default=0.50)
+
+    # Dual-cycle (cardiac) extension — option C: extract respiratory AND
+    # cardiac phase jointly with an 8-dim state branch output.
+    p.add_argument("--cardiac-labels-dir", type=str, default=None,
+                   help="path to cardiac Phase-B labels. Enables dual-head.")
+    p.add_argument("--state-output-dim", type=int, default=4,
+                   choices=[4, 8],
+                   help="4=resp-only (default), 8=dual-cycle (resp+card)")
+    p.add_argument("--lambda-cardiac", type=float, default=0.0,
+                   help="cardiac branch weight in the total loss")
+    p.add_argument("--lambda-cardiac-amp", type=float, default=0.5,
+                   help="cardiac sub-weight for the amplitude term")
+    p.add_argument("--warm-start-ckpt", type=Path, default=None,
+                   help="path to a 4-dim stage-2 ckpt to warm-start an "
+                        "8-dim dual-head model (expands output head)")
 
     # §6.1 main ablation #2: state training protocol
     p.add_argument(
@@ -257,6 +319,16 @@ def run_train_epoch(
         amp_gt = batch["amplitude"].to(device, non_blocking=True)
         amp_scale = batch["amp_scale"].to(device, non_blocking=True)
         valid = batch["valid_mask"].to(device, non_blocking=True).float()
+        # Dual-cycle (cardiac) GT — optional.
+        card_kwargs = {}
+        if "cardiac_cos_phi" in batch:
+            card_kwargs = {
+                "cardiac_cos_gt":     batch["cardiac_cos_phi"].to(device, non_blocking=True),
+                "cardiac_sin_gt":     batch["cardiac_sin_phi"].to(device, non_blocking=True),
+                "cardiac_amp_gt":     batch["cardiac_amplitude"].to(device, non_blocking=True),
+                "cardiac_amp_scale":  batch["cardiac_amp_scale"].to(device, non_blocking=True),
+                "cardiac_valid_mask": batch["cardiac_valid_mask"].to(device, non_blocking=True).float(),
+            }
         curr_seq_names: List[str] = (
             batch["seq_name"] if isinstance(batch["seq_name"], list)
             else list(batch["seq_name"])
@@ -279,7 +351,7 @@ def run_train_epoch(
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             out = model(images, mode="stage2_state", h0=h0)
-            state_pred = out["state"]              # [B, T, 4]
+            state_pred = out["state"]              # [B, T, 4 or 8]
             losses = criterion(
                 state_pred,
                 phase_cos_gt=cos_gt,
@@ -287,8 +359,32 @@ def run_train_epoch(
                 amp_gt=amp_gt,
                 amp_scale=amp_scale,
                 valid_mask=valid,
+                **card_kwargs,
             )
             loss = losses["loss_state"]
+
+            # ---- §III.E physiological priors (paper §IV.E ablation) ----
+            if (
+                args.lambda_phase_smooth > 0
+                or args.lambda_amp_smooth > 0
+                or args.lambda_spectral > 0
+            ):
+                prior = physiological_prior_loss(
+                    cos_pred=state_pred[..., 0],
+                    sin_pred=state_pred[..., 1],
+                    amp_pred=state_pred[..., 2],
+                    amp_scale=amp_scale,
+                    valid_mask=valid,
+                    lambda_phase_smooth=args.lambda_phase_smooth,
+                    lambda_amp_smooth=args.lambda_amp_smooth,
+                    lambda_spectral=args.lambda_spectral,
+                    fs=args.prior_fs,
+                    band_hz=(args.prior_band_low, args.prior_band_high),
+                )
+                loss = loss + prior["loss_phys_prior"]
+                losses["L_phase_smooth"] = prior["L_phase_smooth"]
+                losses["L_amp_smooth"] = prior["L_amp_smooth"]
+                losses["L_spectral"] = prior["L_spectral"]
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -364,6 +460,15 @@ def run_val_epoch(model, loader, criterion, device, use_amp, args):
         amp_gt = batch["amplitude"].to(device, non_blocking=True)
         amp_scale = batch["amp_scale"].to(device, non_blocking=True)
         valid = batch["valid_mask"].to(device, non_blocking=True).float()
+        card_kwargs = {}
+        if "cardiac_cos_phi" in batch:
+            card_kwargs = {
+                "cardiac_cos_gt":     batch["cardiac_cos_phi"].to(device, non_blocking=True),
+                "cardiac_sin_gt":     batch["cardiac_sin_phi"].to(device, non_blocking=True),
+                "cardiac_amp_gt":     batch["cardiac_amplitude"].to(device, non_blocking=True),
+                "cardiac_amp_scale":  batch["cardiac_amp_scale"].to(device, non_blocking=True),
+                "cardiac_valid_mask": batch["cardiac_valid_mask"].to(device, non_blocking=True).float(),
+            }
 
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             out = model(images, mode="stage2_state")
@@ -372,6 +477,7 @@ def run_val_epoch(model, loader, criterion, device, use_amp, args):
                 phase_cos_gt=cos_gt, phase_sin_gt=sin_gt,
                 amp_gt=amp_gt, amp_scale=amp_scale,
                 valid_mask=valid,
+                **card_kwargs,
             )
             loss = losses["loss_state"]
 
@@ -423,24 +529,55 @@ def train(args):
     print0(f"   T_window={args.T_window} stride={args.stride}  width_mult={args.width_mult}")
 
     # ---- Datasets ----
-    excluded = None
-    if args.exclude_sequences_file:
-        excluded = [
-            ln.strip() for ln in Path(args.exclude_sequences_file).read_text().splitlines()
+    def _read_seq_file(path):
+        return [
+            ln.strip() for ln in Path(path).read_text().splitlines()
             if ln.strip() and not ln.strip().startswith("#")
         ]
-    train_set = FluoroSequenceWindowDataset(
-        data_root=args.data_root, state_labels_dir=args.state_labels_dir,
-        split="train", T_window=args.T_window, stride=args.stride,
-        img_size=(args.img_size, args.img_size),
-        excluded_sequences=excluded,
-    )
-    val_set = FluoroSequenceWindowDataset(
-        data_root=args.data_root, state_labels_dir=args.state_labels_dir,
-        split="val", T_window=args.T_window, stride=args.stride,
-        img_size=(args.img_size, args.img_size),
-        excluded_sequences=excluded,
-    )
+
+    excluded = None
+    if args.exclude_sequences_file:
+        excluded = _read_seq_file(args.exclude_sequences_file)
+
+    if args.cv_split:
+        # k-fold CV: both datasets read one pooled split; the train/val
+        # partition is given explicitly by the fold files.
+        if not (args.cv_train_file and args.cv_val_file):
+            raise SystemExit("--cv-split requires --cv-train-file and --cv-val-file")
+        cv_train = _read_seq_file(args.cv_train_file)
+        cv_val = _read_seq_file(args.cv_val_file)
+        print0(f"📂 CV mode: split={args.cv_split}  "
+               f"train={len(cv_train)} seqs  val={len(cv_val)} seqs  "
+               f"augment={args.augment}")
+        train_set = FluoroSequenceWindowDataset(
+            data_root=args.data_root, state_labels_dir=args.state_labels_dir,
+            split=args.cv_split, T_window=args.T_window, stride=args.stride,
+            img_size=(args.img_size, args.img_size),
+            included_sequences=cv_train, augment=args.augment,
+            cardiac_labels_dir=args.cardiac_labels_dir,
+        )
+        val_set = FluoroSequenceWindowDataset(
+            data_root=args.data_root, state_labels_dir=args.state_labels_dir,
+            split=args.cv_split, T_window=args.T_window, stride=args.stride,
+            img_size=(args.img_size, args.img_size),
+            included_sequences=cv_val, augment=False,
+            cardiac_labels_dir=args.cardiac_labels_dir,
+        )
+    else:
+        train_set = FluoroSequenceWindowDataset(
+            data_root=args.data_root, state_labels_dir=args.state_labels_dir,
+            split="train", T_window=args.T_window, stride=args.stride,
+            img_size=(args.img_size, args.img_size),
+            excluded_sequences=excluded, augment=args.augment,
+            cardiac_labels_dir=args.cardiac_labels_dir,
+        )
+        val_set = FluoroSequenceWindowDataset(
+            data_root=args.data_root, state_labels_dir=args.state_labels_dir,
+            split="val", T_window=args.T_window, stride=args.stride,
+            img_size=(args.img_size, args.img_size),
+            excluded_sequences=excluded,
+            cardiac_labels_dir=args.cardiac_labels_dir,
+        )
 
     # State training protocol (paper §8.1.2 main ablation #2)
     if args.state_protocol == "chronological_carry":
@@ -487,6 +624,7 @@ def train(args):
         state_core_type=args.state_core_type,
         state_d_state=args.state_d_state,
         state_detach_encoder=not args.no_state_detach_encoder,
+        state_output_dim=args.state_output_dim,
     ).to(device)
 
     if args.stage1_ckpt is not None:
@@ -499,6 +637,44 @@ def train(args):
             f"🔁 Loaded stage-1 ckpt {args.stage1_ckpt.name} "
             f"(missing={len(missing)}, unexpected={len(unexpected)})"
         )
+
+    # Warm-start from a previously-trained 4-dim stage-2 checkpoint, expanding
+    # the output head 4 -> 8 (resp block initialized from the source, cardiac
+    # block initialized to small random values). All other weights are loaded
+    # verbatim. The expanded resp block keeps the proven resp performance;
+    # the cardiac block starts from scratch and learns alongside.
+    if args.warm_start_ckpt is not None:
+        if not args.warm_start_ckpt.is_file():
+            raise FileNotFoundError(
+                f"warm_start_ckpt not found: {args.warm_start_ckpt}"
+            )
+        wsck = torch.load(args.warm_start_ckpt, map_location="cpu",
+                          weights_only=False)
+        src_sd = wsck.get("model_state_dict", wsck)
+        src_sd = {(k[7:] if k.startswith("module.") else k): v
+                  for k, v in src_sd.items()}
+        inner = model.module if hasattr(model, "module") else model
+        dst_sd = inner.state_dict()
+        # Expand output_head.2 if source is 4-dim and target is 8-dim.
+        head_w_key = "state_branch.output_head.2.weight"
+        head_b_key = "state_branch.output_head.2.bias"
+        if (head_w_key in src_sd and head_w_key in dst_sd
+                and src_sd[head_w_key].shape[0] == 4
+                and dst_sd[head_w_key].shape[0] == 8):
+            new_w = dst_sd[head_w_key].clone()
+            new_w[:4] = src_sd[head_w_key]
+            new_w[4:] = src_sd[head_w_key] * 0.0 + torch.randn_like(
+                src_sd[head_w_key]) * 0.01
+            src_sd[head_w_key] = new_w
+            new_b = dst_sd[head_b_key].clone()
+            new_b[:4] = src_sd[head_b_key]
+            new_b[4:] = 0.0
+            src_sd[head_b_key] = new_b
+            print0("🌱 expanded output_head 4 -> 8 (resp block warm-start, "
+                   "cardiac block small-random init)")
+        miss, unex = inner.load_state_dict(src_sd, strict=False)
+        print0(f"🌱 warm-start from {args.warm_start_ckpt.name} "
+               f"(missing={len(miss)}, unexpected={len(unex)})")
 
     n_frozen = freeze_r1(model)
     print0(f"❄️  Froze {n_frozen} R1 parameters; only state_branch trains.")
@@ -518,6 +694,8 @@ def train(args):
         burn_in_ratio=args.burn_in_ratio,
         burn_in_min_frames=args.burn_in_min_frames,
         burn_in_weight=args.burn_in_weight,
+        lambda_cardiac=args.lambda_cardiac,
+        lambda_cardiac_amp=args.lambda_cardiac_amp,
     ).to(device)
 
     writer = SummaryWriter(log_dir=str(log_dir)) if is_main() else None
@@ -529,8 +707,15 @@ def train(args):
     # 这条路径让长时间运行的训练在脚本崩溃/重启后能从上次 epoch 接着跑。
     if args.resume:
         resume_path = last_path
-        if resume_path.is_file():
-            ck = torch.load(resume_path, map_location="cpu", weights_only=False)
+        ck = None
+        if resume_path.is_file() and resume_path.stat().st_size > 0:
+            try:
+                ck = torch.load(resume_path, map_location="cpu", weights_only=False)
+            except Exception as exc:                       # corrupt checkpoint
+                print0(f"⚠️  --resume checkpoint {resume_path} unreadable "
+                       f"({type(exc).__name__}: {exc}); starting fresh")
+                ck = None
+        if ck is not None:
             sd = ck.get("model_state_dict", ck)
             sd = {
                 (k[len("module."):] if k.startswith("module.") else k): v
@@ -599,11 +784,11 @@ def train(args):
                 "best_val_loss": best_loss,
                 "args": vars(args),
             }
-            torch.save(ckpt, last_path)
+            _atomic_save(ckpt, last_path)
 
             if val_stats["loss_state"] < best_loss:
                 best_loss = val_stats["loss_state"]
-                torch.save(ckpt, best_path)
+                _atomic_save(ckpt, best_path)
                 print0(f"🌟 New best val loss = {best_loss:.4f}")
 
     if writer is not None:
